@@ -231,3 +231,37 @@ pub struct FileExtractions {
     /// Function/method calls.
     pub calls: Vec<ExtractedCall>,
 }
+
+// ─── Graph Search Results ─────────────────────────────────────────────────────
+
+/// Result of a graph-aware search.
+/// Contains the matched symbols AND their connections.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GraphSearchResult {
+    /// How the query matched: "file", "symbol", or "none"
+    pub match_type: String,
+    /// Files that matched (for file-based queries)
+    pub matched_files: Vec<PathBuf>,
+    /// Symbols found (directly matched + connected via BFS)
+    pub symbols: Vec<SymbolInfo>,
+    /// Connections between symbols (edges traversed)
+    pub connections: Vec<ConnectionInfo>,
+}
+
+/// Information about a symbol in search results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolInfo {
+    pub name: String,
+    pub kind: NodeKind,
+    pub file: PathBuf,
+    pub line: usize,
+    pub code: String,
+}
+
+/// A connection (edge) between two symbols.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionInfo {
+    pub from: String,
+    pub to: String,
+    pub relationship: EdgeKind,
+}

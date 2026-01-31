@@ -11,6 +11,6 @@ pub mod types;
 pub use builder::{build_graph, rebuild_file, scan_stats, ScanStats};
 pub use engine::{CodeGraph, DependencyInfo, GraphStats, SearchResult, SymbolRef};
 pub use types::{
-    EdgeData, EdgeKind, ExtractedCall, ExtractedImport, ExtractedSymbol, FileExtractions, NodeData,
-    NodeKind,
+    ConnectionInfo, EdgeData, EdgeKind, ExtractedCall, ExtractedImport, ExtractedSymbol,
+    FileExtractions, GraphSearchResult, NodeData, NodeKind, SymbolInfo,
 };
