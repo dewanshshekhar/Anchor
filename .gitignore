@@ -206,3 +206,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Anchor internal docs (private)
+success_metrics.md
+
+# Vim swap files
+*.swp
+*.swo
+
+# Anchor cache
+.anchor/
