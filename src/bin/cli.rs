@@ -2,17 +2,35 @@
 //!
 //! Usage:
 //!   anchor                       # Show banner and help
-//!   anchor overview              # Codebase overview
+//!   anchor daemon                # Start daemon (foreground)
+//!   anchor daemon start          # Start daemon (background)
+//!   anchor daemon stop           # Stop daemon
 //!   anchor search <query>        # Search symbols/files
 //!   anchor context <query>       # Get full context
 //!   anchor deps <symbol>         # Dependencies
 //!   anchor stats                 # Graph statistics
-//!   anchor build                 # Rebuild graph
+//!   anchor build                 # Force rebuild graph
 
+use anchor::daemon::{is_daemon_running, send_request, start_daemon, Request, Response};
 use anchor::{build_graph, get_context, graph_search, anchor_dependencies, anchor_stats, CodeGraph};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+/// Start daemon in background (silent)
+fn start_daemon_background(root: &PathBuf) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    Command::new(&exe)
+        .arg("--root")
+        .arg(root)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(name = "anchor")]
@@ -28,6 +46,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Manage the anchor daemon
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
+
     /// Show codebase overview - files, key symbols, entry points
     Overview,
 
@@ -64,6 +88,16 @@ enum Commands {
     Build,
 }
 
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start daemon in background
+    Start,
+    /// Stop the running daemon
+    Stop,
+    /// Check daemon status
+    Status,
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -88,7 +122,6 @@ fn print_banner() {
 
 fn run(cli: Cli) -> Result<()> {
     let root = cli.root.canonicalize().unwrap_or(cli.root);
-    let cache_path = root.join(".anchor").join("graph.bin");
 
     // No command = show banner and usage
     if cli.command.is_none() {
@@ -96,6 +129,7 @@ fn run(cli: Cli) -> Result<()> {
         println!("Usage: anchor <COMMAND>");
         println!();
         println!("Commands:");
+        println!("  daemon    Manage the daemon (start, stop, status)");
         println!("  overview  Show codebase overview");
         println!("  search    Search for symbols or files");
         println!("  context   Get full context for a symbol");
@@ -107,30 +141,184 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    // Handle build command separately (doesn't need existing graph)
-    if let Some(Commands::Build) = &cli.command {
-        return cmd_build(&root, &cache_path);
+    // Handle daemon command separately
+    if let Some(Commands::Daemon { action }) = &cli.command {
+        return handle_daemon_command(&root, action.as_ref());
     }
 
-    // For other commands, load the existing graph
+    // Auto-start daemon if not running (silently)
+    if !is_daemon_running(&root) {
+        let _ = start_daemon_background(&root);
+
+        // Wait for daemon to be ready (up to 10 seconds)
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if is_daemon_running(&root) {
+                if send_request(&root, Request::Ping).is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+
+    run_via_daemon(&root, cli.command.unwrap())
+}
+
+/// Handle daemon management commands
+fn handle_daemon_command(root: &PathBuf, action: Option<&DaemonAction>) -> Result<()> {
+    match action {
+        None => {
+            // Run daemon in foreground
+            println!("Starting daemon in foreground (Ctrl+C to stop)...");
+            start_daemon(root)?;
+            Ok(())
+        }
+        Some(DaemonAction::Start) => {
+            if is_daemon_running(root) {
+                println!("Daemon is already running.");
+                return Ok(());
+            }
+
+            // Start daemon in background
+            let exe = std::env::current_exe()?;
+            let child = Command::new(exe)
+                .arg("--root")
+                .arg(root)
+                .arg("daemon")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+
+            println!("Daemon started (PID: {})", child.id());
+            Ok(())
+        }
+        Some(DaemonAction::Stop) => {
+            if !is_daemon_running(root) {
+                println!("Daemon is not running.");
+                return Ok(());
+            }
+
+            match send_request(root, Request::Shutdown) {
+                Ok(Response::Goodbye) => println!("Daemon stopped."),
+                Ok(_) => println!("Unexpected response from daemon."),
+                Err(e) => println!("Failed to stop daemon: {}", e),
+            }
+            Ok(())
+        }
+        Some(DaemonAction::Status) => {
+            if is_daemon_running(root) {
+                // Ping the daemon
+                match send_request(root, Request::Ping) {
+                    Ok(Response::Pong) => println!("Daemon is running and responsive."),
+                    Ok(_) => println!("Daemon is running but gave unexpected response."),
+                    Err(e) => println!("Daemon process exists but not responding: {}", e),
+                }
+            } else {
+                println!("Daemon is not running.");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Run command via daemon (fast path)
+fn run_via_daemon(root: &PathBuf, command: Commands) -> Result<()> {
+    let request = match &command {
+        Commands::Overview => Request::Overview,
+        Commands::Search { query, depth } => Request::Search {
+            query: query.clone(),
+            depth: *depth,
+        },
+        Commands::Context { query, intent } => Request::Context {
+            query: query.clone(),
+            intent: intent.clone(),
+        },
+        Commands::Deps { symbol } => Request::Deps {
+            symbol: symbol.clone(),
+        },
+        Commands::Stats => Request::Stats,
+        Commands::Build => Request::Rebuild,
+        Commands::Daemon { .. } => unreachable!(),
+    };
+
+    match send_request(root, request) {
+        Ok(Response::Ok { data }) => {
+            // Format output based on command type
+            match command {
+                Commands::Overview => {
+                    print_banner();
+                    if let Some(stats) = data.get("stats") {
+                        println!("Files:   {}", stats.get("file_count").and_then(|v| v.as_u64()).unwrap_or(0));
+                        println!("Symbols: {}", stats.get("symbol_count").and_then(|v| v.as_u64()).unwrap_or(0));
+                        println!("Edges:   {}", stats.get("total_edges").and_then(|v| v.as_u64()).unwrap_or(0));
+                    }
+                    println!();
+                    if let Some(files) = data.get("files").and_then(|v| v.as_array()) {
+                        println!("Structure:");
+                        for file in files.iter().take(15) {
+                            if let Some(path) = file.as_str() {
+                                println!("  {}", path);
+                            }
+                        }
+                        if files.len() > 15 {
+                            println!("  ... and {} more", files.len() - 15);
+                        }
+                    }
+                }
+                Commands::Search { query, depth } => {
+                    println!("Search: '{}' (depth={}) [via daemon]", query, depth);
+                    println!();
+                    println!("{}", serde_json::to_string_pretty(&data)?);
+                }
+                _ => {
+                    println!("{}", serde_json::to_string_pretty(&data)?);
+                }
+            }
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon error: {}", message);
+            Ok(())
+        }
+        Ok(_) => {
+            eprintln!("Unexpected response from daemon");
+            Ok(())
+        }
+        Err(_) => {
+            // Silently fall back to local mode
+            run_local(root, command)
+        }
+    }
+}
+
+/// Run command locally (loads graph from disk)
+fn run_local(root: &PathBuf, command: Commands) -> Result<()> {
+    let cache_path = root.join(".anchor").join("graph.bin");
+
+    // Handle build command separately
+    if let Commands::Build = command {
+        return cmd_build(root, &cache_path);
+    }
+
+    // Load graph
     let graph = if cache_path.exists() {
         CodeGraph::load(&cache_path)?
     } else {
         eprintln!("Building graph (first run)...");
-        let graph = build_graph(&root);
+        let graph = build_graph(root);
         std::fs::create_dir_all(cache_path.parent().unwrap())?;
         graph.save(&cache_path)?;
         graph
     };
 
-    match cli.command {
-        Some(Commands::Overview) => cmd_overview(&graph),
-        Some(Commands::Search { query, depth }) => cmd_search(&graph, &query, depth),
-        Some(Commands::Context { query, intent }) => cmd_context(&graph, &query, &intent),
-        Some(Commands::Deps { symbol }) => cmd_deps(&graph, &symbol),
-        Some(Commands::Stats) => cmd_stats(&graph),
-        Some(Commands::Build) => unreachable!(), // Handled above
-        None => unreachable!(), // Handled above
+    match command {
+        Commands::Overview => cmd_overview(&graph),
+        Commands::Search { query, depth } => cmd_search(&graph, &query, depth),
+        Commands::Context { query, intent } => cmd_context(&graph, &query, &intent),
+        Commands::Deps { symbol } => cmd_deps(&graph, &symbol),
+        Commands::Stats => cmd_stats(&graph),
+        Commands::Build => unreachable!(),
+        Commands::Daemon { .. } => unreachable!(),
     }
 }
 
@@ -159,7 +347,6 @@ fn cmd_overview(graph: &CodeGraph) -> Result<()> {
     println!("Edges:   {}", stats.total_edges);
     println!();
 
-    // Show top-level structure
     let result = graph_search(graph, "src/", 0);
     if !result.matched_files.is_empty() {
         println!("Structure:");
@@ -172,7 +359,6 @@ fn cmd_overview(graph: &CodeGraph) -> Result<()> {
     }
     println!();
 
-    // Show entry points (main functions)
     let mains = graph_search(graph, "main", 0);
     if !mains.symbols.is_empty() {
         println!("Entry points:");
