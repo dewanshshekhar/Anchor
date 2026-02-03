@@ -1,13 +1,19 @@
-#!/bin/bash
-# Anchor installer
-# Usage: curl -fsSL https://tharun-10dragneel.github.io/Anchor/install.sh | bash
+#!/usr/bin/env bash
+# Anchor installer (production-grade)
+# Usage:
+#   curl -fsSL https://tharun-10dragneel.github.io/Anchor/install.sh | bash
+#
 
-set -e
+set -euo pipefail
 
 REPO="Tharun-10Dragneel/Anchor"
-INSTALL_DIR="/usr/local/bin"
 
-# Detect OS and architecture
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+
+mkdir -p "$INSTALL_DIR"
+
+echo "Installing Anchor → $INSTALL_DIR"
+
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 
@@ -16,13 +22,13 @@ case "$OS" in
     case "$ARCH" in
       x86_64) BINARY="anchor-macos-intel" ;;
       arm64)  BINARY="anchor-macos-arm" ;;
-      *)      echo "Unsupported architecture: $ARCH"; exit 1 ;;
+      *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
     esac
     ;;
   linux)
     case "$ARCH" in
       x86_64) BINARY="anchor-linux-x64" ;;
-      *)      echo "Unsupported architecture: $ARCH"; exit 1 ;;
+      *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
     esac
     ;;
   *)
@@ -31,37 +37,54 @@ case "$OS" in
     ;;
 esac
 
-# Get latest release (including pre-releases)
-LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases" \
+  | grep '"tag_name"' | head -1 | cut -d'"' -f4)
 
-if [ -z "$LATEST" ]; then
-  echo "Failed to get latest release"
-  exit 1
+[ -z "$LATEST" ] && { echo "Failed to get latest release"; exit 1; }
+
+echo "Version: $LATEST"
+
+URL="https://github.com/$REPO/releases/download/$LATEST/$BINARY.tar.gz"
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+curl -fsSL "$URL" | tar -xz -C "$TMP"
+
+FILES=("anchor" "anchor-mcp")
+
+install_file () {
+  src="$1"
+  dest="$2"
+
+  if [ -w "$INSTALL_DIR" ]; then
+    mv "$src" "$dest"
+  else
+    echo "Requesting sudo permission..."
+    sudo mv "$src" "$dest"
+  fi
+}
+
+for f in "${FILES[@]}"; do
+  install_file "$TMP/$f" "$INSTALL_DIR/$f"
+  chmod +x "$INSTALL_DIR/$f"
+done
+
+echo ""
+echo "Anchor installed successfully!"
+echo ""
+echo "Try:"
+echo "  anchor --help"
+echo ""
+echo "Update later:"
+echo "  anchor update"
+echo ""
+echo "Uninstall:"
+echo "  curl -fsSL https://tharun-10dragneel.github.io/Anchor/uninstall.sh | bash"
+echo ""
+
+# PATH hint
+if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
+  echo "Tip: add ~/.local/bin to PATH:"
+  echo '  export PATH="$HOME/.local/bin:$PATH"'
 fi
-
-echo "Installing Anchor $LATEST..."
-
-# Download and extract
-DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST/$BINARY.tar.gz"
-TMP_DIR=$(mktemp -d)
-
-curl -fsSL "$DOWNLOAD_URL" | tar -xz -C "$TMP_DIR"
-
-# Install
-sudo mv "$TMP_DIR/anchor" "$INSTALL_DIR/anchor"
-sudo mv "$TMP_DIR/anchor-mcp" "$INSTALL_DIR/anchor-mcp"
-sudo chmod +x "$INSTALL_DIR/anchor" "$INSTALL_DIR/anchor-mcp"
-
-# Cleanup
-rm -rf "$TMP_DIR"
-
-echo "Anchor installed to $INSTALL_DIR"
-echo ""
-echo "Get started:"
-echo "  anchor              # Show help"
-echo "  anchor search foo   # Search symbols"
-echo "  anchor stats        # Graph statistics"
-echo "  anchor update       # Update to latest version"
-echo ""
-echo "Daemon auto-starts on first command. Run 'anchor --help' for all commands."
-
