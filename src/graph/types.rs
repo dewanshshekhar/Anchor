@@ -246,6 +246,9 @@ pub struct GraphSearchResult {
     pub symbols: Vec<SymbolInfo>,
     /// Connections between symbols (edges traversed)
     pub connections: Vec<ConnectionInfo>,
+    /// True if results were truncated due to limits
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// Information about a symbol in search results.

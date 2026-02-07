@@ -85,12 +85,8 @@ impl CodeGraph {
         let idx = self.graph.add_node(data);
 
         // Update indexes
-        self.symbol_index
-            .entry(name.clone())
-            .or_default()
-            .push(idx);
-        self.qualified_index
-            .insert((file_path, name), idx);
+        self.symbol_index.entry(name.clone()).or_default().push(idx);
+        self.qualified_index.insert((file_path, name), idx);
 
         idx
     }
@@ -155,27 +151,48 @@ impl CodeGraph {
         results
     }
 
+    /// Get all symbols in the graph (for regex filtering).
+    ///
+    /// Returns all non-removed symbols as SearchResults.
+    /// Use with caution on large graphs — consider using `search` with a filter.
+    pub fn all_symbols(&self) -> Vec<SearchResult> {
+        self.symbol_index
+            .values()
+            .flatten()
+            .filter_map(|&idx| self.build_search_result(idx))
+            .collect()
+    }
+
     /// Graph-aware search: finds by file path OR symbol name, then traverses connections.
     ///
     /// This is the PROPER search that uses the graph:
     /// 1. Try to match file paths (fuzzy)
     /// 2. Try to match symbol names
     /// 3. BFS traverse to get connected nodes
+    ///
+    /// Limits: max 10 initial matches, max 50 symbols, max 100 connections
     pub fn search_graph(&self, query: &str, depth: usize) -> GraphSearchResult {
+        const MAX_INITIAL_MATCHES: usize = 10;
+        const MAX_SYMBOLS: usize = 50;
+        const MAX_CONNECTIONS: usize = 100;
+
         let query_lower = query.to_lowercase();
         let mut result = GraphSearchResult::default();
 
-        // 1. Try file path match first
-        let file_matches: Vec<_> = self.file_index.iter()
+        // 1. Try file path match first (limited)
+        let file_matches: Vec<_> = self
+            .file_index
+            .iter()
             .filter(|(path, &idx)| {
                 let path_str = path.to_string_lossy().to_lowercase();
-                self.is_live(idx) && (
-                    path_str.contains(&query_lower) ||
-                    path.file_name()
-                        .map(|n| n.to_string_lossy().to_lowercase().contains(&query_lower))
-                        .unwrap_or(false)
-                )
+                self.is_live(idx)
+                    && (path_str.contains(&query_lower)
+                        || path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_lowercase().contains(&query_lower))
+                            .unwrap_or(false))
             })
+            .take(MAX_INITIAL_MATCHES)
             .collect();
 
         if !file_matches.is_empty() {
@@ -185,10 +202,16 @@ impl CodeGraph {
             let mut symbol_indexes: Vec<NodeIndex> = Vec::new();
 
             for (path, &file_idx) in &file_matches {
+                if result.symbols.len() >= MAX_SYMBOLS {
+                    break;
+                }
                 result.matched_files.push(path.to_path_buf());
 
                 // Get all symbols defined in this file (traverse Defines edges)
                 for edge in self.graph.edges_directed(file_idx, Direction::Outgoing) {
+                    if result.symbols.len() >= MAX_SYMBOLS {
+                        break;
+                    }
                     if edge.weight().kind == EdgeKind::Defines && self.is_live(edge.target()) {
                         symbol_indexes.push(edge.target());
                         let node = &self.graph[edge.target()];
@@ -208,10 +231,16 @@ impl CodeGraph {
                 let mut visited: HashSet<NodeIndex> = symbol_indexes.iter().copied().collect();
 
                 for &idx in &symbol_indexes {
+                    if result.connections.len() >= MAX_CONNECTIONS {
+                        break;
+                    }
                     let node = &self.graph[idx];
 
                     // Outgoing edges (what this symbol uses/calls)
                     for edge in self.graph.edges_directed(idx, Direction::Outgoing) {
+                        if result.connections.len() >= MAX_CONNECTIONS {
+                            break;
+                        }
                         let target = edge.target();
                         if self.is_live(target) && !visited.contains(&target) {
                             visited.insert(target);
@@ -228,6 +257,9 @@ impl CodeGraph {
 
                     // Incoming edges (what calls/uses this symbol)
                     for edge in self.graph.edges_directed(idx, Direction::Incoming) {
+                        if result.connections.len() >= MAX_CONNECTIONS {
+                            break;
+                        }
                         let source = edge.source();
                         if self.is_live(source) && !visited.contains(&source) {
                             visited.insert(source);
@@ -244,14 +276,26 @@ impl CodeGraph {
                 }
             }
 
+            // Mark as truncated if we hit limits
+            if result.symbols.len() >= MAX_SYMBOLS || result.connections.len() >= MAX_CONNECTIONS {
+                result.truncated = true;
+            }
+
             return result;
         }
 
-        // 2. Try symbol name match
-        let symbol_matches: Vec<NodeIndex> = self.symbol_index.iter()
-            .filter(|(name, _)| name.to_lowercase().contains(&query_lower))
+        // 2. Try symbol name match (limited) - exact or prefix only, no fuzzy substring
+        let symbol_matches: Vec<NodeIndex> = self
+            .symbol_index
+            .iter()
+            .filter(|(name, _)| {
+                let name_lower = name.to_lowercase();
+                // Exact match or prefix match only - no arbitrary substring
+                name_lower == query_lower || name_lower.starts_with(&query_lower)
+            })
             .flat_map(|(_, indexes)| indexes.iter().copied())
             .filter(|&idx| self.is_live(idx))
+            .take(MAX_INITIAL_MATCHES)
             .collect();
 
         if symbol_matches.is_empty() {
@@ -271,9 +315,14 @@ impl CodeGraph {
         }
 
         while let Some((idx, current_depth)) = queue.pop_front() {
+            // Stop if we've hit limits
+            if result.symbols.len() >= MAX_SYMBOLS && result.connections.len() >= MAX_CONNECTIONS {
+                break;
+            }
+
             let node = &self.graph[idx];
 
-            if node.kind != NodeKind::File {
+            if node.kind != NodeKind::File && result.symbols.len() < MAX_SYMBOLS {
                 result.symbols.push(SymbolInfo {
                     name: node.name.clone(),
                     kind: node.kind,
@@ -283,10 +332,13 @@ impl CodeGraph {
                 });
             }
 
-            // Continue BFS if within depth limit
-            if current_depth < depth {
+            // Continue BFS if within depth limit and connection limit
+            if current_depth < depth && result.connections.len() < MAX_CONNECTIONS {
                 // Outgoing edges (what this symbol uses)
                 for edge in self.graph.edges_directed(idx, Direction::Outgoing) {
+                    if result.connections.len() >= MAX_CONNECTIONS {
+                        break;
+                    }
                     let target = edge.target();
                     if self.is_live(target) && !visited.contains(&target) {
                         visited.insert(target);
@@ -305,6 +357,9 @@ impl CodeGraph {
 
                 // Incoming edges (what uses this symbol)
                 for edge in self.graph.edges_directed(idx, Direction::Incoming) {
+                    if result.connections.len() >= MAX_CONNECTIONS {
+                        break;
+                    }
                     let source = edge.source();
                     if self.is_live(source) && !visited.contains(&source) {
                         visited.insert(source);
@@ -321,6 +376,11 @@ impl CodeGraph {
                     }
                 }
             }
+        }
+
+        // Mark as truncated if we hit limits
+        if result.symbols.len() >= MAX_SYMBOLS || result.connections.len() >= MAX_CONNECTIONS {
+            result.truncated = true;
         }
 
         result
@@ -396,7 +456,9 @@ impl CodeGraph {
             }
             self.graph
                 .edges_directed(file_idx, Direction::Outgoing)
-                .filter(|edge| edge.weight().kind == EdgeKind::Defines && self.is_live(edge.target()))
+                .filter(|edge| {
+                    edge.weight().kind == EdgeKind::Defines && self.is_live(edge.target())
+                })
                 .map(|edge| &self.graph[edge.target()])
                 .collect()
         } else {
@@ -410,7 +472,11 @@ impl CodeGraph {
             .get(&(file_path.to_path_buf(), name.to_string()))
             .and_then(|&idx| {
                 let node = &self.graph[idx];
-                if node.removed { None } else { Some(node) }
+                if node.removed {
+                    None
+                } else {
+                    Some(node)
+                }
             })
     }
 
@@ -444,9 +510,7 @@ impl CodeGraph {
 
     /// Check if a node is live (not removed).
     fn is_live(&self, idx: NodeIndex) -> bool {
-        self.graph
-            .node_weight(idx)
-            .is_some_and(|n| !n.removed)
+        self.graph.node_weight(idx).is_some_and(|n| !n.removed)
     }
 
     /// Build a SearchResult from a node index, including connections.
@@ -520,7 +584,10 @@ impl CodeGraph {
     /// Build the graph from a set of file extractions.
     /// This is the main entry point for populating the graph.
     pub fn build_from_extractions(&mut self, extractions: Vec<FileExtractions>) {
-        debug!(file_count = extractions.len(), "ingesting extractions into graph");
+        debug!(
+            file_count = extractions.len(),
+            "ingesting extractions into graph"
+        );
         // Phase 1: Add all file nodes and symbol nodes
         for extraction in &extractions {
             let file_idx = self.add_file(extraction.file_path.clone());
@@ -941,7 +1008,8 @@ mod tests {
             "login".to_string(),
             NodeKind::Function,
             PathBuf::from("src/auth.rs"),
-            1, 10,
+            1,
+            10,
             "fn login() {}".to_string(),
         );
         graph.add_edge(file_idx, fn_idx, EdgeKind::Defines);
@@ -953,7 +1021,10 @@ mod tests {
 
         let stats = graph.stats();
         assert_eq!(stats.file_count, 0, "File should be removed from stats");
-        assert_eq!(stats.symbol_count, 0, "Symbols should be removed from stats");
+        assert_eq!(
+            stats.symbol_count, 0,
+            "Symbols should be removed from stats"
+        );
     }
 
     #[test]
@@ -964,7 +1035,8 @@ mod tests {
             "login".to_string(),
             NodeKind::Function,
             PathBuf::from("src/auth.rs"),
-            1, 10,
+            1,
+            10,
             "fn login() {}".to_string(),
         );
         graph.add_edge(file_idx, fn_idx, EdgeKind::Defines);
@@ -975,7 +1047,11 @@ mod tests {
         graph.remove_file(Path::new("src/auth.rs"));
 
         // After removal: gone
-        assert_eq!(graph.search("login", 3).len(), 0, "Removed symbol should not appear in search");
+        assert_eq!(
+            graph.search("login", 3).len(),
+            0,
+            "Removed symbol should not appear in search"
+        );
     }
 
     #[test]
@@ -988,7 +1064,8 @@ mod tests {
             "login".to_string(),
             NodeKind::Function,
             PathBuf::from("src/auth.rs"),
-            1, 10,
+            1,
+            10,
             "fn login() { v1 }".to_string(),
         );
         graph.add_edge(file_idx, fn_idx, EdgeKind::Defines);
@@ -1002,14 +1079,19 @@ mod tests {
             "login".to_string(),
             NodeKind::Function,
             PathBuf::from("src/auth.rs"),
-            1, 15,
+            1,
+            15,
             "fn login() { v2 }".to_string(),
         );
         graph.add_edge(file_idx2, fn_idx2, EdgeKind::Defines);
 
         // Should have exactly 1 result with v2 content
         let results = graph.search("login", 3);
-        assert_eq!(results.len(), 1, "Should have exactly 1 result after re-add");
+        assert_eq!(
+            results.len(),
+            1,
+            "Should have exactly 1 result after re-add"
+        );
         assert!(results[0].code.contains("v2"), "Should have updated code");
 
         let stats = graph.stats();
@@ -1027,7 +1109,8 @@ mod tests {
             "login".to_string(),
             NodeKind::Function,
             PathBuf::from("src/auth.rs"),
-            1, 10,
+            1,
+            10,
             "fn login() {}".to_string(),
         );
         graph.add_edge(file_a, login, EdgeKind::Defines);
@@ -1038,7 +1121,8 @@ mod tests {
             "main".to_string(),
             NodeKind::Function,
             PathBuf::from("src/main.rs"),
-            1, 5,
+            1,
+            5,
             "fn main() {}".to_string(),
         );
         graph.add_edge(file_b, main_fn, EdgeKind::Defines);
@@ -1069,7 +1153,8 @@ mod tests {
             "main".to_string(),
             NodeKind::Function,
             PathBuf::from("src/main.rs"),
-            1, 10,
+            1,
+            10,
             "fn main() { login(); }".to_string(),
         );
         graph.add_edge(file_a, main_fn, EdgeKind::Defines);
@@ -1080,7 +1165,8 @@ mod tests {
             "login".to_string(),
             NodeKind::Function,
             PathBuf::from("src/auth.rs"),
-            1, 10,
+            1,
+            10,
             "fn login() {}".to_string(),
         );
         graph.add_edge(file_b, login_fn, EdgeKind::Defines);
@@ -1096,7 +1182,11 @@ mod tests {
         // After removal: login should have no callers
         let results = graph.search("login", 3);
         assert_eq!(results.len(), 1, "login itself should still exist");
-        assert_eq!(results[0].called_by.len(), 0, "Removed caller should disappear from called_by");
+        assert_eq!(
+            results[0].called_by.len(),
+            0,
+            "Removed caller should disappear from called_by"
+        );
     }
 
     #[test]
@@ -1109,7 +1199,8 @@ mod tests {
             "old_fn".to_string(),
             NodeKind::Function,
             PathBuf::from("src/old.rs"),
-            1, 10,
+            1,
+            10,
             "fn old_fn() {}".to_string(),
         );
         graph.add_edge(file_idx, fn_idx, EdgeKind::Defines);
@@ -1120,7 +1211,8 @@ mod tests {
             "keep_fn".to_string(),
             NodeKind::Function,
             PathBuf::from("src/keep.rs"),
-            1, 5,
+            1,
+            5,
             "fn keep_fn() {}".to_string(),
         );
         graph.add_edge(file_keep, keep_fn, EdgeKind::Defines);
@@ -1158,7 +1250,8 @@ mod tests {
             "main".to_string(),
             NodeKind::Function,
             PathBuf::from("src/main.rs"),
-            1, 5,
+            1,
+            5,
             "fn main() {}".to_string(),
         );
         graph.add_edge(file_idx, fn_idx, EdgeKind::Defines);
@@ -1206,14 +1299,16 @@ mod tests {
             "func_a".to_string(),
             NodeKind::Function,
             PathBuf::from("src/cycle.rs"),
-            1, 5,
+            1,
+            5,
             "fn func_a() { func_b(); }".to_string(),
         );
         let b_idx = graph.add_symbol(
             "func_b".to_string(),
             NodeKind::Function,
             PathBuf::from("src/cycle.rs"),
-            6, 10,
+            6,
+            10,
             "fn func_b() { func_a(); }".to_string(),
         );
 
@@ -1245,7 +1340,8 @@ mod tests {
             "init".to_string(),
             NodeKind::Function,
             PathBuf::from("src/a.rs"),
-            1, 5,
+            1,
+            5,
             "fn init() { /* a */ }".to_string(),
         );
         graph.add_edge(file_a, init_a, EdgeKind::Defines);
@@ -1255,7 +1351,8 @@ mod tests {
             "init".to_string(),
             NodeKind::Function,
             PathBuf::from("src/b.rs"),
-            1, 5,
+            1,
+            5,
             "fn init() { /* b */ }".to_string(),
         );
         graph.add_edge(file_b, init_b, EdgeKind::Defines);
@@ -1291,7 +1388,8 @@ mod tests {
             "main".to_string(),
             NodeKind::Function,
             PathBuf::from("src/main.rs"),
-            1, 5,
+            1,
+            5,
             "fn main() {}".to_string(),
         );
         graph.add_edge(file_idx, fn_idx, EdgeKind::Defines);
@@ -1307,7 +1405,8 @@ mod tests {
             "process".to_string(),
             NodeKind::Function,
             PathBuf::from("src/main.rs"),
-            1, 5,
+            1,
+            5,
             "fn process() {}".to_string(),
         );
 

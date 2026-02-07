@@ -18,10 +18,9 @@ use crate::parser::{extract_file, SupportedLanguage};
 /// Respects .gitignore, walks recursively, parses all supported
 /// language files, and returns a fully connected CodeGraph.
 pub fn build_graph(root: &Path) -> CodeGraph {
-    // Phase 1: Collect all parseable source files
     let files: Vec<_> = WalkBuilder::new(root)
-        .hidden(true) // skip hidden files
-        .git_ignore(true) // respect .gitignore
+        .hidden(true)
+        .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .build()
@@ -30,8 +29,6 @@ pub fn build_graph(root: &Path) -> CodeGraph {
         .filter(|entry| SupportedLanguage::from_path(entry.path()).is_some())
         .map(|entry| entry.into_path())
         .collect();
-
-    // Phase 2: Parse all files in parallel
     let extractions: Mutex<Vec<FileExtractions>> = Mutex::new(Vec::with_capacity(files.len()));
 
     files.par_iter().for_each(|file_path| {
@@ -46,22 +43,17 @@ pub fn build_graph(root: &Path) -> CodeGraph {
 
     let extractions = extractions.into_inner().unwrap_or_default();
 
-    // Phase 3: Build the graph from extractions
     let mut graph = CodeGraph::new();
     graph.build_from_extractions(extractions);
 
     graph
 }
 
-/// Rebuild a single file in the graph (for incremental updates).
 pub fn rebuild_file(
     graph: &mut CodeGraph,
     file_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Remove old data for this file
     graph.remove_file(file_path);
-
-    // Re-parse and re-add
     let source = fs::read_to_string(file_path)?;
     let extraction = extract_file(file_path, &source)?;
     graph.build_from_extractions(vec![extraction]);
@@ -88,13 +80,7 @@ pub fn scan_stats(root: &Path) -> ScanStats {
                 SupportedLanguage::Python => stats.python_files += 1,
                 SupportedLanguage::JavaScript => stats.js_files += 1,
                 SupportedLanguage::TypeScript | SupportedLanguage::Tsx => stats.ts_files += 1,
-                // Other languages counted in total_files only
-                SupportedLanguage::Go
-                | SupportedLanguage::Java
-                | SupportedLanguage::CSharp
-                | SupportedLanguage::Ruby
-                | SupportedLanguage::Cpp
-                | SupportedLanguage::Swift => {}
+                _ => {}
             }
         }
     }
@@ -102,7 +88,6 @@ pub fn scan_stats(root: &Path) -> ScanStats {
     stats
 }
 
-/// Statistics about files found during scanning.
 #[derive(Debug, Clone, Default)]
 pub struct ScanStats {
     pub total_files: usize,
