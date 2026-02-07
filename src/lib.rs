@@ -26,27 +26,43 @@
 //! // Returns: symbol code + dependencies + dependents
 //! ```
 
+pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod error;
-pub mod storage;
 pub mod graph;
-pub mod mcp;
+pub mod graphql;
+pub mod lock;
 pub mod parser;
 pub mod query;
+pub mod regex;
+pub mod storage;
 pub mod updater;
 pub mod watcher;
+pub mod write;
 
 // Re-exports for convenience
 pub use error::{AnchorError, Result};
 
 // Graph re-exports
-pub use graph::{build_graph, CodeGraph, NodeKind, EdgeKind, SearchResult, GraphStats};
+pub use graph::{build_graph, CodeGraph, EdgeKind, GraphStats, NodeKind, SearchResult};
 pub use parser::SupportedLanguage;
 pub use query::{
-    anchor_search, anchor_dependencies, anchor_file_symbols, anchor_stats,
-    get_context, graph_search, Query, ContextResponse, SearchResponse, StatsResponse,
+    anchor_dependencies, anchor_file_symbols, anchor_search, anchor_stats, get_context,
+    get_context_for_change, graph_search, ContextResponse, Edit, Query, Reference, SearchResponse,
+    Signature, StatsResponse, Symbol,
 };
+
+// Write operations
+pub use write::{
+    create_file, insert_after, insert_before, replace_all, replace_first, WriteError, WriteResult,
+};
+
+// GraphQL
+pub use graphql::{build_schema, execute, AnchorSchema};
+
+// Regex engine (Brzozowski derivatives - ReDoS-safe)
+pub use regex::{parse as parse_regex, Matcher as RegexMatcher, Regex};
 
 #[cfg(test)]
 mod tests {
@@ -54,7 +70,6 @@ mod tests {
 
     #[test]
     fn test_parse_rust_code() {
-        // Parse a Rust source string through the full pipeline
         let source = r#"
 use std::collections::HashMap;
 
@@ -90,36 +105,31 @@ fn main() {
         let path = PathBuf::from("test.rs");
         let extraction = parser::extract_file(&path, source).unwrap();
 
-        // Should find: Config (struct), Config (impl), new, get, set (methods), main (function)
         assert!(!extraction.symbols.is_empty());
 
         let symbol_names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(symbol_names.contains(&"Config"), "Should find struct Config");
-        assert!(symbol_names.contains(&"main"), "Should find fn main");
-        assert!(symbol_names.contains(&"new"), "Should find method new");
-        assert!(symbol_names.contains(&"get"), "Should find method get");
-        assert!(symbol_names.contains(&"set"), "Should find method set");
+        assert!(symbol_names.contains(&"Config"));
+        assert!(symbol_names.contains(&"main"));
+        assert!(symbol_names.contains(&"new"));
+        assert!(symbol_names.contains(&"get"));
+        assert!(symbol_names.contains(&"set"));
 
-        // Should find the import
         assert!(!extraction.imports.is_empty());
         assert!(extraction.imports[0].path.contains("HashMap"));
 
-        // Build graph and query it
         let mut graph = CodeGraph::new();
         graph.build_from_extractions(vec![extraction]);
 
         let stats = graph.stats();
-        assert!(stats.symbol_count >= 5, "Should have at least 5 symbols");
-        assert_eq!(stats.file_count, 1, "Should have 1 file");
+        assert!(stats.symbol_count >= 5);
+        assert_eq!(stats.file_count, 1);
 
-        // Search for Config
         let results = graph.search("Config", 3);
-        assert!(!results.is_empty(), "Should find Config");
+        assert!(!results.is_empty());
         assert_eq!(results[0].symbol, "Config");
 
-        // Search for main
         let results = graph.search("main", 3);
-        assert!(!results.is_empty(), "Should find main");
+        assert!(!results.is_empty());
     }
 
     #[test]
@@ -148,11 +158,10 @@ def main():
         let extraction = parser::extract_file(&path, source).unwrap();
 
         let symbol_names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(symbol_names.contains(&"UserService"), "Should find class UserService");
-        assert!(symbol_names.contains(&"main"), "Should find function main");
-        assert!(symbol_names.contains(&"get_user"), "Should find method get_user");
+        assert!(symbol_names.contains(&"UserService"));
+        assert!(symbol_names.contains(&"main"));
+        assert!(symbol_names.contains(&"get_user"));
 
-        // Build graph
         let mut graph = CodeGraph::new();
         graph.build_from_extractions(vec![extraction]);
 
@@ -189,13 +198,11 @@ const API_URL = "https://api.example.com";
         let extraction = parser::extract_file(&path, source).unwrap();
 
         let symbol_names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(symbol_names.contains(&"ApiClient"), "Should find class ApiClient");
-        assert!(symbol_names.contains(&"App"), "Should find function App");
+        assert!(symbol_names.contains(&"ApiClient"));
+        assert!(symbol_names.contains(&"App"));
 
-        // Should find imports
         assert!(!extraction.imports.is_empty());
 
-        // Build graph and query
         let mut graph = CodeGraph::new();
         graph.build_from_extractions(vec![extraction]);
 
@@ -206,27 +213,20 @@ const API_URL = "https://api.example.com";
 
     #[test]
     fn test_build_graph_self() {
-        // Build graph of the Anchor project itself
         use std::path::Path;
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let graph = build_graph(&src_dir);
 
         let stats = graph.stats();
-        // The Anchor src/ directory should have multiple Rust files
-        assert!(stats.file_count > 0, "Should find source files");
-        assert!(stats.symbol_count > 0, "Should find symbols");
-        assert!(stats.total_edges > 0, "Should find edges");
+        assert!(stats.file_count > 0);
+        assert!(stats.symbol_count > 0);
+        assert!(stats.total_edges > 0);
 
-        // Should be able to find our own types
         let results = graph.search("CodeGraph", 3);
-        assert!(!results.is_empty(), "Should find CodeGraph struct");
+        assert!(!results.is_empty());
 
         let results = graph.search("Storage", 3);
-        assert!(!results.is_empty(), "Should find Storage struct");
-
-        let results = graph.search("CodeGraph", 3);
-        assert!(!results.is_empty(), "Should find CodeGraph struct");
-
+        assert!(!results.is_empty());
     }
 
     #[test]
@@ -253,14 +253,12 @@ fn check_password(pw: &str) -> bool {
         let mut graph = CodeGraph::new();
         graph.build_from_extractions(vec![extraction]);
 
-        // Test anchor_search with simple query
         let response = anchor_search(&graph, Query::Simple("login".to_string()));
         assert!(response.found);
         assert_eq!(response.count, 1);
         assert_eq!(response.results[0].symbol, "login");
         assert!(response.results[0].code.contains("pub fn login"));
 
-        // Test anchor_search with structured query
         let response = anchor_search(
             &graph,
             Query::Structured {
@@ -272,12 +270,9 @@ fn check_password(pw: &str) -> bool {
         assert!(response.found);
         assert_eq!(response.results[0].symbol, "validate");
 
-        // Test anchor_dependencies
         let deps = anchor_dependencies(&graph, "login");
-        // login should have dependencies (calls validate and check_password)
         assert!(!deps.dependencies.is_empty() || deps.dependents.is_empty());
 
-        // Test anchor_stats
         let stats_response = anchor_stats(&graph);
         assert!(stats_response.stats.symbol_count >= 3);
     }
@@ -285,22 +280,18 @@ fn check_password(pw: &str) -> bool {
     #[test]
     fn test_extract_unsupported_language() {
         use std::path::PathBuf;
-        // Use a truly unsupported extension (.lua is not supported)
         let path = PathBuf::from("main.lua");
         let result = parser::extract_file(&path, "print('hello')");
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, AnchorError::UnsupportedLanguage(_)),
-            "Expected UnsupportedLanguage, got: {:?}",
-            err
-        );
+        assert!(matches!(
+            result.unwrap_err(),
+            AnchorError::UnsupportedLanguage(_)
+        ));
     }
 
     #[test]
     fn test_extract_empty_source() {
         use std::path::PathBuf;
-        // Empty source is valid — tree-sitter parses it to an empty AST
         let path = PathBuf::from("empty.rs");
         let extraction = parser::extract_file(&path, "").unwrap();
         assert!(extraction.symbols.is_empty());
@@ -311,11 +302,9 @@ fn check_password(pw: &str) -> bool {
     #[test]
     fn test_extract_malformed_syntax() {
         use std::path::PathBuf;
-        // tree-sitter is error-tolerant — it should still parse
-        let source = "fn broken( { struct }}}}";
+        let source = "fn broken( { struct }}}";
         let path = PathBuf::from("bad.rs");
         let result = parser::extract_file(&path, source);
-        // Should succeed (tree-sitter is lenient), but may find fewer symbols
         assert!(result.is_ok());
     }
 
@@ -364,6 +353,54 @@ struct Gamma {}
     }
 
     #[test]
+    fn test_get_context_intents() {
+        // Build a graph with test scenarios
+        let source = r#"
+pub fn process(input: &str) -> String {
+    validate(input);
+    transform(input)
+}
+
+fn validate(s: &str) -> bool {
+    !s.is_empty()
+}
+
+fn transform(s: &str) -> String {
+    s.to_uppercase()
+}
+
+#[test]
+fn test_process() {
+    assert_eq!(process("hi"), "HI");
+}
+"#;
+        use std::path::PathBuf;
+        let path = PathBuf::from("src/lib.rs");
+        let extraction = parser::extract_file(&path, source).unwrap();
+
+        let mut graph = CodeGraph::new();
+        graph.build_from_extractions(vec![extraction]);
+
+        // Test "explore" intent - understand the symbol
+        let response = get_context(&graph, "validate", "explore");
+        assert!(response.found);
+        assert!(!response.symbols.is_empty());
+        assert_eq!(response.intent, "explore");
+
+        // Test "change" intent - what breaks if I modify
+        let response = get_context(&graph, "validate", "change");
+        assert!(response.found);
+        assert_eq!(response.intent, "change");
+        // Should have edits for dependents
+
+        // Test "create" intent - patterns to follow
+        let response = get_context(&graph, "validate", "create");
+        assert!(response.found);
+        assert_eq!(response.intent, "create");
+        // Should find similar functions like transform
+    }
+
+    #[test]
     fn test_parse_unicode_identifiers_python() {
         // Python supports unicode identifiers
         let source = r#"
@@ -378,8 +415,14 @@ class Ñoño:
         let extraction = parser::extract_file(&path, source).unwrap();
 
         let symbol_names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(symbol_names.contains(&"café"), "Should find unicode function name");
-        assert!(symbol_names.contains(&"Ñoño"), "Should find unicode class name");
+        assert!(
+            symbol_names.contains(&"café"),
+            "Should find unicode function name"
+        );
+        assert!(
+            symbol_names.contains(&"Ñoño"),
+            "Should find unicode class name"
+        );
 
         // Build graph and search
         let mut graph = CodeGraph::new();
@@ -426,7 +469,10 @@ function createApp(): void {
         assert!(symbol_names.contains(&"UserDTO"), "Should find interface");
         assert!(symbol_names.contains(&"UserID"), "Should find type alias");
         assert!(symbol_names.contains(&"Role"), "Should find enum");
-        assert!(symbol_names.contains(&"UserController"), "Should find class");
+        assert!(
+            symbol_names.contains(&"UserController"),
+            "Should find class"
+        );
         assert!(symbol_names.contains(&"createApp"), "Should find function");
 
         let mut graph = CodeGraph::new();
@@ -435,5 +481,24 @@ function createApp(): void {
         let results = graph.search("UserDTO", 3);
         assert!(!results.is_empty());
         assert_eq!(results[0].kind, NodeKind::Interface);
+    }
+}
+
+#[cfg(test)]
+mod benchmarks {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn benchmark_search() {
+        let repo_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let graph = build_graph(&repo_path);
+
+        let start = std::time::Instant::now();
+        let _result = graph_search(&graph, "CodeGraph", 2);
+        let elapsed = start.elapsed();
+
+        println!("Search benchmark: {}ms", elapsed.as_millis());
+        assert!(elapsed.as_millis() < 100);
     }
 }

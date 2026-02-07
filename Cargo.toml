@@ -19,10 +19,6 @@ name = "anchor"
 path = "src/bin/cli.rs"
 
 [[bin]]
-name = "anchor-mcp"
-path = "src/bin/mcp.rs"
-
-[[bin]]
 name = "write-bench"
 path = "src/bin/write_bench.rs"
 
@@ -82,6 +78,9 @@ notify-debouncer-mini = "0.5"
 
 # Parallelism
 rayon = "1.10"
+
+# GraphQL
+async-graphql = "7.0"
 
 # Unix process utilities
 libc = "0.2"
