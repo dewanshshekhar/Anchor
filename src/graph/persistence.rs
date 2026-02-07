@@ -30,8 +30,8 @@ impl CodeGraph {
         info!(path = %path.display(), "saving graph");
 
         let sg = self.to_serializable();
-        let bytes = bincode::serialize(&sg)
-            .map_err(|e| AnchorError::SerializeError(e.to_string()))?;
+        let bytes =
+            bincode::serialize(&sg).map_err(|e| AnchorError::SerializeError(e.to_string()))?;
 
         // Atomic write: write to .tmp, then rename
         let tmp_path = path.with_extension("tmp");
@@ -70,18 +70,15 @@ impl CodeGraph {
         let graph = self.inner_graph();
 
         // Collect nodes in index order
-        let nodes: Vec<NodeData> = graph
-            .node_indices()
-            .map(|idx| graph[idx].clone())
-            .collect();
+        let nodes: Vec<NodeData> = graph.node_indices().map(|idx| graph[idx].clone()).collect();
 
         // Collect edges as (source_index, target_index, data)
         let edges: Vec<(u32, u32, EdgeData)> = graph
             .edge_indices()
             .filter_map(|eidx| {
-                graph.edge_endpoints(eidx).map(|(src, tgt)| {
-                    (src.index() as u32, tgt.index() as u32, graph[eidx].clone())
-                })
+                graph
+                    .edge_endpoints(eidx)
+                    .map(|(src, tgt)| (src.index() as u32, tgt.index() as u32, graph[eidx].clone()))
             })
             .collect();
 

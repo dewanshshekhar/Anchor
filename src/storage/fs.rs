@@ -20,12 +20,16 @@ impl Storage {
         if !root.exists() {
             fs::create_dir_all(root)?;
         }
-        Ok(Self { root: root.to_path_buf() })
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
     }
 
     /// Open existing storage directory.
     pub fn open(root: &Path) -> Result<Self> {
-        Ok(Self { root: root.to_path_buf() })
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
     }
 
     /// Get root path.
