@@ -15,3 +15,7 @@ remove() {
 
 remove "$INSTALL_DIR/anchor"
 remove "$INSTALL_DIR/anchor-mcp"
+
+echo ""
+echo "Anchor uninstalled."
+echo ""

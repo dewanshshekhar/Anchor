@@ -9,14 +9,15 @@
 pub mod daemon;
 pub mod plan;
 pub mod read;
-pub mod write;
+// pub mod write;  // TODO: Write operations not finalized yet
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "anchor")]
-#[command(about = "Anchor - Code Intelligence for AI Agents", long_about = None)]
+#[command(about = "Code Intelligence for AI Agents")]
+#[command(override_help = HELP_TEXT)]
 pub struct Cli {
     /// Project root directory (default: current directory)
     #[arg(short, long, default_value = ".")]
@@ -26,9 +27,46 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
+const HELP_TEXT: &str = "
+  █████╗ ███╗   ██╗ ██████╗██╗  ██╗ ██████╗ ██████╗
+ ██╔══██╗████╗  ██║██╔════╝██║  ██║██╔═══██╗██╔══██╗
+ ███████║██╔██╗ ██║██║     ███████║██║   ██║██████╔╝
+ ██╔══██║██║╚██╗██║██║     ██╔══██║██║   ██║██╔══██╗
+ ██║  ██║██║ ╚████║╚██████╗██║  ██║╚██████╔╝██║  ██║
+ ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝
+        Code Intelligence for AI Agents
+
+Start here:
+  build                 Index codebase
+  map                   Codebase map (modules + top symbols)
+  map <scope>           Zoom into module
+
+Query:
+  context <symbol>      Code + callers + callees
+  search <query>        Find symbols
+  plan <file.json>      Batch read operations
+
+Other:
+  overview              Files + symbol counts
+  stats                 Graph statistics
+
+Options:
+  -r, --root <PATH>     Project root (default: .)
+";
+
 #[derive(Subcommand)]
 pub enum Commands {
-    // ─── Read/Search (3 commands) ─────────────────────────────────
+    // ─── Query Commands ─────────────────────────────────────────────
+    /// Get symbol context (code + callers + callees)
+    Context {
+        /// Symbol name to query
+        query: String,
+
+        /// Max results
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+    },
+
     /// Search for symbols (lightweight: names, files, lines)
     Search {
         /// Symbol name to search for
@@ -43,63 +81,40 @@ pub enum Commands {
         limit: usize,
     },
 
-    /// Read full context for a symbol (code + callers + callees)
-    Read {
-        /// Symbol name
-        symbol: String,
-    },
-
-    /// Search + Read combined (find + full context)
-    Context {
-        /// Query (symbol name or file path)
-        query: String,
-
-        /// Max results
-        #[arg(short, long, default_value = "5")]
-        limit: usize,
-    },
-
-    // ─── Write (2 commands) - TODO: ACI-based ─────────────────────
-    /// Create or overwrite a file
-    Write {
-        /// File path
-        path: String,
-
-        /// File content (or - for stdin)
-        content: String,
-    },
-
-    /// Edit an existing file (insert, replace, delete)
-    Edit {
-        /// File path
-        path: String,
-
-        /// Action: insert, replace, delete
-        #[arg(short, long)]
-        action: String,
-
-        /// Pattern to find
-        #[arg(short, long)]
-        pattern: String,
-
-        /// Content (for insert/replace)
-        #[arg(short, long)]
-        content: Option<String>,
-    },
-
     // ─── Parallel (1 command) ─────────────────────────────────────
-    /// Execute parallel operations from plan.json
+    /// Execute parallel read operations from plan.json
     Plan {
         /// Path to plan JSON file
         file: String,
     },
 
+    // ─── Write (hidden - not finalized) ──────────────────────────
+    #[command(hide = true)]
+    Write {
+        path: String,
+        content: String,
+    },
+
+    #[command(hide = true)]
+    Edit {
+        path: String,
+        #[arg(short, long)]
+        action: String,
+        #[arg(short, long)]
+        pattern: String,
+        #[arg(short, long)]
+        content: Option<String>,
+    },
+
     // ─── Overview ─────────────────────────────────────────────────
+    /// Compact codebase map for AI agents
+    Map {
+        /// Optional scope: zoom into specific module/directory
+        scope: Option<String>,
+    },
+
     /// Show codebase overview (files, structure, key symbols)
     Overview,
-
-    /// List all indexed files as tree
-    Files,
 
     // ─── System ───────────────────────────────────────────────────
     /// Build/rebuild the code graph
@@ -108,19 +123,28 @@ pub enum Commands {
     /// Show graph statistics
     Stats,
 
+    // ─── Hidden Commands ─────────────────────────────────────────
+    /// List all indexed files
+    #[command(hide = true)]
+    Files,
+
     /// Manage the anchor daemon
+    #[command(hide = true)]
     Daemon {
         #[command(subcommand)]
         action: Option<daemon::DaemonAction>,
     },
 
     /// Update anchor to latest version
+    #[command(hide = true)]
     Update,
 
     /// Uninstall anchor (runs shell script)
+    #[command(hide = true)]
     Uninstall,
 
     /// Show version
+    #[command(hide = true)]
     Version,
 }
 
@@ -142,24 +166,5 @@ pub fn print_banner() {
 
 /// Print usage help
 pub fn print_usage() {
-    println!("Start here:");
-    println!("  build                 Index codebase (auto-starts watcher)");
-    println!("  overview              Files + symbol counts by directory");
-    println!("  files                 List all indexed files");
-    println!();
-    println!("Query (use context first):");
-    println!("  context <query>       Search + code + callers + callees");
-    println!("  search <query>        Find symbols (NAME KIND FILE:LINE)");
-    println!("  search -p <regex>     Find by pattern");
-    println!("  read <symbol>         Full context for exact symbol");
-    println!();
-    println!("Output format:");
-    println!("  NAME KIND FILE:LINE");
-    println!("  > callers");
-    println!("  < callees");
-    println!("  --- code");
-    println!();
-    println!("Write:");
-    println!("  write <path> <content>");
-    println!("  edit <path> -a insert|replace|delete -p <pattern> [-c content]");
+    print!("{}", HELP_TEXT);
 }
